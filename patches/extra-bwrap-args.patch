@@ -1,0 +1,25 @@
+--- a/src/launcher/lib/launch_config/linux/compute.py	2026-11-05 16:41:19.113560665 +0100
++++ b/src/launcher/lib/launch_config/linux/compute.py	2026-11-05 16:41:19.176749746 +0100
+@@ -2,6 +2,7 @@
+ destinations overlay in order, so the emission order here is what is
+ enforced."""
+ 
++import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Mapping, Sequence
+@@ -238,6 +239,14 @@
+     args += list(binds.parent_symlinks)
+     args += list(git_args)
+ 
++    # agentlock: extra bubblewrap arguments decided at launch time (masking
++    # files inside the workspace, read-only overlays, runtime binds). A file
++    # of NUL-separated arguments, named by the host environment.
++    extra_args_file = os.environ.get("AGENT_SANDBOX_EXTRA_BWRAP_ARGS_FILE")
++    if extra_args_file:
++        with open(extra_args_file, encoding="utf-8") as handle:
++            args += [arg for arg in handle.read().split("\0") if arg]
++
+     # The socket itself, not its directory, which for a socket resolving into
+     # /run would hand over every other daemon's socket there. Emitted after
+     # the masks and the declared binds, either of which would otherwise mount
