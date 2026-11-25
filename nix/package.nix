@@ -2,7 +2,7 @@
 { pkgs, agentSandboxSrc }:
 let
   lib = pkgs.lib;
-  version = "0.1.0";
+  version = "0.1.1";
 
   # agent-sandbox.nix plus one small patch: a runtime list of extra
   # bubblewrap arguments, which agentlock uses to hide .env files and lock
