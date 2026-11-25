@@ -80,8 +80,9 @@ fi
 if [ -e /etc/fonts/fonts.conf ]; then
   check "fonts found"               0 '[ -n "$(fc-list)" ]'
 fi
-if [ -d ~/.config/uv ]; then
-  check "~/.config/uv read-only"    1 'touch ~/.config/uv/agentlock-smoke'
+if [ -f ~/.config/uv/uv.toml ]; then
+  check "~/.config/uv/uv.toml read-only" 1 'echo x >> ~/.config/uv/uv.toml'
+  check "~/.config/uv/uv.toml readable"  0 'cmp -s ~/.config/uv/uv.toml /dev/stdin < ~/.config/uv/uv.toml && [ -s ~/.config/uv/uv.toml ]'
 fi
 C=${XDG_CACHE_HOME:-$HOME/.cache}/agentlock/home/.cache/uv
 check "uv cache writable"           0 'touch ~/.cache/uv/agentlock-smoke'

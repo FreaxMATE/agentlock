@@ -132,6 +132,9 @@ NIX_LD_LOADERS = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"]
 NIX_LD_DIR = "/run/current-system/sw/share/nix-ld"
 FONTS_DIR = "/etc/fonts"
 HOME_READ_ONLY = [".config/uv"]
+# Every bind is three bubblewrap arguments, and bubblewrap takes at most
+# 9000 in total; the sandbox itself needs some of them.
+MAX_STORE_PATHS = 1500
 # Home folders that keep their contents between sessions. They are the
 # sandbox's own copies in ~/.cache/agentlock/home, never your real ones:
 # your uv runs those Pythons and unpacks those cached wheels outside the
@@ -579,7 +582,9 @@ def tree_roots(path: Path) -> set[str]:
     that would be the whole system."""
     start = Path(os.path.realpath(path.parent)) / path.name
     if start.is_symlink():
-        return link_roots(str(start))
+        # Bubblewrap binds the final target, so only its closure is needed.
+        root = store_root(os.path.realpath(start))
+        return {root} if root else set()
     roots: set[str] = set()
     for d, dirs, files in os.walk(start):
         for n in dirs + files:
@@ -658,12 +663,6 @@ def host_setup(create: bool) -> tuple[list[str], dict[str, str], list[str]]:
             share(d)
         summary.append("fonts")
 
-    for rel in HOME_READ_ONLY:
-        if (HOME / rel).exists():
-            share(HOME / rel)
-            summary.append(f"~/{rel}")
-    summary = [", ".join(summary) + " (read-only)"] if summary else []
-
     binds: list[str] = []
     roots: set[str] = set()
     outside = []
@@ -673,11 +672,33 @@ def host_setup(create: bool) -> tuple[list[str], dict[str, str], list[str]]:
         else:
             roots |= tree_roots(t)
             outside.append(t)
+    closure = store_closure(roots)
+    if len(closure) > MAX_STORE_PATHS:
+        say(f"not sharing {', '.join(summary)}: they need {len(closure)} Nix store paths, "
+            f"more than the sandbox can mount ({MAX_STORE_PATHS}).")
+        closure, outside, summary = [], [], []
     # Store paths first: a shared file may sit inside one of them.
-    for p in store_closure(roots):
+    for p in closure:
         binds += ["--ro-bind", p, p]
     for t in outside:
         binds += ["--ro-bind", str(t), str(t)]
+
+    for rel in HOME_READ_ONLY:
+        d = HOME / rel
+        if not d.exists():
+            continue
+        # File by file, without store closures: home-manager links these
+        # into its own store path, whose closure is your whole home config.
+        top = os.path.realpath(d)
+        for dirpath, _dirs, files in os.walk(d, followlinks=True):
+            for n in files:
+                f = os.path.join(dirpath, n)
+                real = os.path.realpath(f)
+                if os.path.isfile(real) and (store_root(real) or real.startswith(top + "/")):
+                    binds += ["--ro-bind", real, f]
+        summary.append(f"~/{rel}")
+    if summary:
+        summary = [", ".join(summary) + f" (read-only, {len(closure)} store paths)"]
 
     for rel in HOME_PERSISTENT:
         src = CACHE_DIR / "home" / rel
