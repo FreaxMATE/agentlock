@@ -98,7 +98,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".direnv",
 MAX_DEPTH = 8
 
 # Environment variables handed from VS Code / your shell to the agent.
-PASS_PREFIXES = ("CLAUDE_", "ANTHROPIC_", "MCP_", "OTEL_", "DISABLE_", "MAX_THINKING")
+PASS_PREFIXES = ("CLAUDE_", "ANTHROPIC_", "MCP_", "OTEL_", "DISABLE_", "MAX_THINKING", "NIX_LD")
 PASS_NAMES = {"TERM", "COLORTERM", "TZ", "NO_COLOR", "FORCE_COLOR", "EDITOR", "VISUAL"}
 # Never taken from .env files or passed through: the sandbox sets these.
 RESERVED = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "OLDPWD",
@@ -124,6 +124,19 @@ TRUST_FILE = STATE_DIR / "agentlock" / "trusted.json"
 # your other sessions.
 CLAUDE_LOCKED_FILES = ["settings.json", "settings.local.json", "CLAUDE.md", "keybindings.json"]
 CLAUDE_LOCKED_DIRS = ["hooks", "plugins", "skills", "agents", "commands", "output-styles", "rules"]
+
+# Host setup that prebuilt Python wheels, uv's Pythons and fonts rely on
+# (NixOS: programs.nix-ld, fonts.packages). Shared read-only, together with
+# the Nix store paths it points to, in every project where it exists.
+NIX_LD_LOADERS = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"]
+NIX_LD_DIR = "/run/current-system/sw/share/nix-ld"
+FONTS_DIR = "/etc/fonts"
+HOME_READ_ONLY = [".config/uv"]
+# Home folders that keep their contents between sessions. They are the
+# sandbox's own copies in ~/.cache/agentlock/home, never your real ones:
+# your uv runs those Pythons and unpacks those cached wheels outside the
+# sandbox, and every app on your desktop reads the fontconfig cache.
+HOME_PERSISTENT = [".local/share/uv", ".cache/uv", ".cache/fontconfig"]
 
 
 def say(msg: str) -> None:
@@ -514,8 +527,8 @@ def runtime_dir() -> Path:
 
 def run(argv: list[str], shell: bool = False) -> int:
     # VS Code's claudeProcessWrapper calls us as: agentlock <its claude binary> <args>.
-    # We run Nix's claude instead (the bundled one needs nix-ld, which the
-    # sandbox does not have), so drop that path.
+    # We run Nix's claude instead (part of the sandbox, so it is the one
+    # Claude sees and keeps the sandbox self-contained), so drop that path.
     if argv and os.path.isabs(argv[0]) and os.path.basename(argv[0]).startswith("claude") \
             and os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK):
         argv = argv[1:]
@@ -537,6 +550,147 @@ def run(argv: list[str], shell: bool = False) -> int:
         shutil.rmtree(rt, ignore_errors=True)
 
 
+def store_root(p: str) -> str | None:
+    parts = Path(p).parts
+    if len(parts) > 3 and parts[1:3] == ("nix", "store"):
+        return "/" + "/".join(parts[1:4])
+    return None
+
+
+def link_roots(link: str) -> set[str]:
+    """Every store path a symlink chain passes through (home-manager links
+    point into one store path, which links on to the next)."""
+    roots = set()
+    cur = link
+    for _ in range(40):
+        if not os.path.islink(cur):
+            break
+        cur = os.path.normpath(os.path.join(os.path.dirname(cur), os.readlink(cur)))
+        if root := store_root(cur):
+            roots.add(root)
+    if root := store_root(os.path.realpath(link)):
+        roots.add(root)
+    return roots
+
+
+def tree_roots(path: Path) -> set[str]:
+    """Store paths a shared host file or folder needs. Not the store path a
+    merged folder itself lives in: for /run/current-system/sw/share/...
+    that would be the whole system."""
+    start = Path(os.path.realpath(path.parent)) / path.name
+    if start.is_symlink():
+        return link_roots(str(start))
+    roots: set[str] = set()
+    for d, dirs, files in os.walk(start):
+        for n in dirs + files:
+            f = os.path.join(d, n)
+            if os.path.islink(f):
+                roots |= link_roots(f)
+    return roots
+
+
+def store_closure(roots: set[str]) -> list[str]:
+    valid = sorted(r for r in roots if os.path.exists(r))
+    if not valid:
+        return []
+    nix_store = shutil.which("nix-store") or "/run/current-system/sw/bin/nix-store"
+    try:
+        r = subprocess.run([nix_store, "--query", "--requisites", *valid],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if r.returncode == 0:
+            return r.stdout.split()
+    except OSError:
+        pass
+    say("could not look up the Nix store paths of nix-ld and fonts; they may not work inside.")
+    return []
+
+
+def font_dirs(fonts: Path) -> list[Path]:
+    """Font folders outside the store that fontconfig is told to read, such
+    as /run/current-system/sw/share/X11/fonts (fonts.fontDir.enable)."""
+    out = []
+    for d, _dirs, files in os.walk(os.path.realpath(fonts), followlinks=True):
+        for n in files:
+            if not n.endswith(".conf"):
+                continue
+            try:
+                text = Path(d, n).read_text(errors="replace")
+            except OSError:
+                continue
+            for m in re.finditer(r"<dir(\s[^>]*)?>\s*([^<\s]+)\s*</dir>", text):
+                p = Path(m.group(2))
+                if "prefix" in (m.group(1) or "") or not p.is_absolute() or store_root(str(p)):
+                    continue
+                if p.exists() and not p.is_relative_to(HOME) and p not in out:
+                    out.append(p)
+    return out
+
+
+def host_setup(create: bool) -> tuple[list[str], dict[str, str], list[str]]:
+    """Bubblewrap arguments, environment and a summary for the host setup
+    every sandbox shares (nix-ld, fonts, uv)."""
+    trees: list[Path] = []
+    env: dict[str, str] = {}
+    summary: list[str] = []
+
+    def share(p: Path) -> None:
+        if p.exists() and not any(p == t or p.is_relative_to(t) for t in trees):
+            trees.append(p)
+
+    loaders = [Path(p) for p in NIX_LD_LOADERS if os.path.exists(p)]
+    if loaders:
+        for p in loaders:
+            share(p)
+        share(Path(NIX_LD_DIR))
+        if "NIX_LD" not in os.environ and Path(NIX_LD_DIR, "lib", "ld.so").exists():
+            env["NIX_LD"] = f"{NIX_LD_DIR}/lib/ld.so"
+            env.setdefault("NIX_LD_LIBRARY_PATH", f"{NIX_LD_DIR}/lib")
+        for k, v in {**os.environ, **env}.items():
+            if k.startswith("NIX_LD"):
+                for part in v.split(":"):
+                    if part.startswith("/") and not part.startswith(str(HOME)):
+                        share(Path(part))
+        summary.append("nix-ld")
+
+    if Path(FONTS_DIR).exists():
+        share(Path(FONTS_DIR))
+        for d in font_dirs(Path(FONTS_DIR)):
+            share(d)
+        summary.append("fonts")
+
+    for rel in HOME_READ_ONLY:
+        if (HOME / rel).exists():
+            share(HOME / rel)
+            summary.append(f"~/{rel}")
+    summary = [", ".join(summary) + " (read-only)"] if summary else []
+
+    binds: list[str] = []
+    roots: set[str] = set()
+    outside = []
+    for t in trees:
+        if root := store_root(str(t)):
+            roots.add(root)
+        else:
+            roots |= tree_roots(t)
+            outside.append(t)
+    # Store paths first: a shared file may sit inside one of them.
+    for p in store_closure(roots):
+        binds += ["--ro-bind", p, p]
+    for t in outside:
+        binds += ["--ro-bind", str(t), str(t)]
+
+    for rel in HOME_PERSISTENT:
+        src = CACHE_DIR / "home" / rel
+        if create:
+            src.mkdir(parents=True, exist_ok=True)
+        binds += ["--bind", str(src), str(HOME / rel)]
+    # The uv cache and the project are separate mounts, so uv cannot
+    # hardlink between them and would warn on every install.
+    env["UV_LINK_MODE"] = "copy"
+    summary.append("own uv Pythons, uv cache and font cache (kept between sessions)")
+    return binds, env, summary
+
+
 def launch(launcher: Path, argv: list[str], workspace: Path, project: Path, s: dict, rt: Path, shell: bool) -> int:
     binds: list[str] = []
     empty = rt / "empty"
@@ -547,8 +701,13 @@ def launch(launcher: Path, argv: list[str], workspace: Path, project: Path, s: d
 
     cdir = HOME / ".claude"
 
-    # 1. Extra folders from the config. First, so the hiding and locking
-    #    below always win over them.
+    # 0. Host setup every sandbox shares (nix-ld, fonts, uv). First, so
+    #    your own files.read_only/read_write entries win over it.
+    setup_binds, setup_env, _ = host_setup(create=True)
+    binds.extend(setup_binds)
+
+    # 1. Extra folders from the config. Before the hiding and locking below,
+    #    so those always win over them.
     for kind, flag in (("read_only", "--ro-bind"), ("read_write", "--bind")):
         for entry in s["files"][kind]:
             p = expand(entry, project).resolve()
@@ -589,6 +748,7 @@ def launch(launcher: Path, argv: list[str], workspace: Path, project: Path, s: d
             env[k] = v
     # Only the built-in C.UTF-8 locale exists inside (no locale data).
     env["LANG"] = "C.UTF-8"
+    env.update(setup_env)
     inject = s["secrets"]["inject"]
     for name in s["secrets"]["env_files"]:
         values = parse_env_file(expand(name, project))
@@ -683,8 +843,9 @@ def init_project(project: Path, quiet: bool = False) -> None:
     say(f"created {target}: this project's sandbox rules (edit it any time).")
 
 
-def edit_toml(path: Path, section: str, key: str, value, mode: str) -> None:
-    """mode: 'add' to a list, 'remove' from a list, or 'set'."""
+def edit_toml(path: Path, section: str, key: str, value, mode: str) -> bool:
+    """mode: 'add' to a list, 'remove' from a list, or 'set'. Returns
+    whether the file changed."""
     doc = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
     if section not in doc:
         doc[section] = tomlkit.table()
@@ -696,11 +857,12 @@ def edit_toml(path: Path, section: str, key: str, value, mode: str) -> None:
         if current is None:
             current = tomlkit.array()
             table[key] = current
-        if mode == "add" and value not in current:
+        if (mode == "add") == (value in current):
+            return False
+        if mode == "add":
             current.append(value)
-        if mode == "remove":
-            while value in current:
-                current.remove(value)
+        while mode == "remove" and value in current:
+            current.remove(value)
     # Our edit keeps the file trusted if it was, or if nothing in it widened
     # access before (then the only widening part is the one just made here).
     was_trusted = (not path.exists() or path == GLOBAL_FILE or is_trusted(path)
@@ -712,6 +874,7 @@ def edit_toml(path: Path, section: str, key: str, value, mode: str) -> None:
             trust(path)
         else:
             say(f"note: {path} also has changes not made by agentlock; review it and run `agentlock trust`.")
+    return True
 
 
 ALLOW_KINDS = {
@@ -748,8 +911,17 @@ def cmd_allow(args: list[str], remove: bool = False) -> int:
             # Store absolute (with ~) so the entry means the same in every project.
             p = p.resolve()
             val = "~/" + str(p.relative_to(HOME)) if p.is_relative_to(HOME) else str(p)
-        edit_toml(target, section, key, val, "remove" if remove else "add")
-        say(("removed " if remove else "allowed ") + f"{kind} {val} in {target}")
+        vals = [val]
+        if kind in ("ro", "rw") and remove:
+            # The shell expands ~ while the file stores it: compare paths.
+            want = expand(v, project).resolve()
+            listed = load_toml(target).get(section, {}).get(key, []) if target.exists() else []
+            vals = [e for e in listed if isinstance(e, str) and expand(e, project).resolve() == want]
+        changed = [x for x in vals if edit_toml(target, section, key, x, "remove" if remove else "add")]
+        if changed:
+            say(("removed " if remove else "allowed ") + f"{kind} {', '.join(map(str, changed))} in {target}")
+        else:
+            say(f"{kind} {v} was {'not' if remove else 'already'} in {target}")
     if kind == "domain" and not remove:
         s = load_settings(project)
         if s["network"]["mode"] == "open":
@@ -820,6 +992,7 @@ def cmd_status() -> int:
     print(f"git:       commit {'allowed' if g['allow_commit'] else 'blocked'}, push {'allowed' if g['allow_push'] else 'blocked'}")
     extra = [p for p in s["tools"]["packages"] if p not in DEFAULTS["tools"]["packages"]]
     print(f"tools:     defaults{' + ' + ', '.join(extra) if extra else ''}")
+    print(f"host:      {'; '.join(host_setup(create=False)[2])}")
     blocks = recent_blocks()
     print()
     if not blocks:

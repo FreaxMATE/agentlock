@@ -25,5 +25,6 @@
   "gnumake",
   "nodejs",
   "python3",
-  "uv"
+  "uv",
+  "fontconfig"
 ]

@@ -72,6 +72,26 @@ check "alias trick blocked"         1 'git -c alias.p="push --no-verify" p'
 check "push blocked"                1 'git push https://github.com/example/example HEAD'
 check "push via real git blocked"   0 'g=$(ls -d /nix/store/*-git-[0-9]*/bin/git | head -1); $g push https://github.com/example/example HEAD 2>&1 | grep -q agentlock-push-blocked'
 
+# Host setup (only checked where this computer has it).
+if [ -e /lib64/ld-linux-x86-64.so.2 ] || [ -e /lib/ld-linux-aarch64.so.1 ]; then
+  check "nix-ld loader and libs"    0 '{ [ -e /lib64/ld-linux-x86-64.so.2 ] || [ -e /lib/ld-linux-aarch64.so.1 ]; } && [ -e "$NIX_LD" ] && ls "${NIX_LD_LIBRARY_PATH%%:*}" | grep -q "^libstdc++.so.6$"'
+  check "nix-ld not writable"       1 'touch "${NIX_LD_LIBRARY_PATH%%:*}/x"'
+fi
+if [ -e /etc/fonts/fonts.conf ]; then
+  check "fonts found"               0 '[ -n "$(fc-list)" ]'
+fi
+if [ -d ~/.config/uv ]; then
+  check "~/.config/uv read-only"    1 'touch ~/.config/uv/agentlock-smoke'
+fi
+C=${XDG_CACHE_HOME:-$HOME/.cache}/agentlock/home/.cache/uv
+check "uv cache writable"           0 'touch ~/.cache/uv/agentlock-smoke'
+if [ -e "$C/agentlock-smoke" ] && [ ! -e ~/.cache/uv/agentlock-smoke ]; then
+  pass=$((pass + 1)); echo "ok    uv cache is the sandbox's own"
+else
+  fail=$((fail + 1)); echo "FAIL  uv cache is the sandbox's own"
+fi
+rm -f "$C/agentlock-smoke"
+
 # A config planted in a subfolder must not count.
 printf '[git]\nallow_push = true\n' >sub/.agentlock.toml
 out=$(cd sub && "$AL" status 2>&1)

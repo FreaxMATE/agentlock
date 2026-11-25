@@ -22,6 +22,8 @@ Run Claude Code in a sandbox on Linux, without thinking about it.
 | Internet | open | `agentlock network allowlist` / `off` |
 | Services on localhost | blocked | `agentlock allow port 5432` |
 | Programs | git, gh, curl, jq, rg, fd, node, python3, uv, make, ... | `agentlock allow pkg cargo` |
+| Your nix-ld libraries, fonts, `~/.config/uv` (if set up) | read only | |
+| uv's Pythons and cache, font cache | the sandbox's own copies, kept between sessions | |
 | Your login, history, memory (`~/.claude`) | shared | |
 | Your Claude settings, hooks, plugins, skills, CLAUDE.md | read only | |
 | `.agentlock.toml`, `.vscode/` (created if missing) | read only | |
@@ -88,6 +90,9 @@ agentlock network open                   # whole internet again
 agentlock shell                          # look around inside the sandbox
 ```
 
+With `network allowlist`, uv needs `pypi.org`, `files.pythonhosted.org` and,
+to download Pythons, `github.com` and `githubusercontent.com`.
+
 Add `--everywhere` to change a rule for all projects
 (`~/.config/agentlock/config.toml`). Changes apply the next time Claude starts
 (VS Code: open a new Claude tab).
@@ -112,6 +117,10 @@ Settings that only restrict Claude always apply.
   Claude hooks (`.claude/settings.json`) and MCP servers (`.mcp.json`).
   Review diffs before running them, and be careful with `claude-unsandboxed`
   in a project Claude has worked on.
+* **The sandbox's uv Pythons and cache are shared by all your projects.**
+  A session in one project could leave a tampered package there that a
+  session in another project then uses (inside its sandbox). Your own uv
+  folders are never touched.
 * **`.env` files are hidden as they are at start.** One created or replaced
   during a session stays visible until Claude restarts.
 * **It is only as strong as bubblewrap and your kernel.** It does not hide
@@ -129,6 +138,11 @@ Settings that only restrict Claude always apply.
   deleted on exit) and loaded inside the sandbox.
 * Inside, `git` is a wrapper that blocks push and `--no-verify`, checks
   commit messages and then runs the project's own hooks.
+* If your computer has nix-ld (`programs.nix-ld`) and fonts
+  (`fonts.packages`), the loader, the libraries, `/etc/fonts` and exactly
+  the Nix store paths they point to are shared read-only, so prebuilt
+  Python wheels (numpy, polars) and matplotlib work. Writable state for uv
+  and fontconfig lives in `~/.cache/agentlock/home`, not in your home.
 * Sandboxes for non-default programs or network rules are built on first use
   and cached in `~/.cache/agentlock`.
 
